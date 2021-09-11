@@ -39,7 +39,7 @@ pub struct PartialSolution<P: Package, V: Version, Priority: Ord + Clone> {
     current_decision_level: DecisionLevel,
     package_assignments: FnvIndexMap<P, PackageAssignments<P, V>>,
     prioritized_potential_packages: PriorityQueue<P, Priority, BuildHasherDefault<FxHasher>>,
-    just_backtracked: bool,
+    changed_this_decision_level: usize,
 }
 
 impl<P: Package, V: Version, Priority: Ord + Clone> Display for PartialSolution<P, V, Priority> {
@@ -137,7 +137,7 @@ impl<P: Package, V: Version, Priority: Ord + Clone> PartialSolution<P, V, Priori
             current_decision_level: DecisionLevel(0),
             package_assignments: FnvIndexMap::default(),
             prioritized_potential_packages: PriorityQueue::default(),
-            just_backtracked: false,
+            changed_this_decision_level: 0,
         }
     }
 
@@ -156,6 +156,10 @@ impl<P: Package, V: Version, Priority: Ord + Clone> PartialSolution<P, V, Priori
                     }
                 },
             }
+            assert_eq!(
+                self.changed_this_decision_level,
+                self.package_assignments.len()
+            );
         }
         let new_idx = self.current_decision_level.0 as usize;
         self.current_decision_level = self.current_decision_level.increment();
@@ -190,8 +194,10 @@ impl<P: Package, V: Version, Priority: Ord + Clone> PartialSolution<P, V, Priori
             cause,
         };
         self.next_global_index += 1;
+        let pa_last_index = self.package_assignments.len().saturating_sub(1);
         match self.package_assignments.entry(package) {
             Entry::Occupied(mut occupied) => {
+                let idx = occupied.index();
                 let mut pa = occupied.get_mut();
                 pa.highest_decision_level = self.current_decision_level;
                 match &mut pa.assignments_intersection {
@@ -201,11 +207,21 @@ impl<P: Package, V: Version, Priority: Ord + Clone> PartialSolution<P, V, Priori
                     }
                     AssignmentsIntersection::Derivations(t) => {
                         *t = t.intersection(&term);
+                        if t.is_positive() {
+                            // we can use `swap_indices` to make `changed_this_decision_level` only go down by 1
+                            // but the copying is slower then the larger search
+                            self.changed_this_decision_level =
+                                std::cmp::min(self.changed_this_decision_level, idx);
+                        }
                     }
                 }
                 pa.dated_derivations.push(dated_derivation);
             }
             Entry::Vacant(v) => {
+                if term.is_positive() {
+                    self.changed_this_decision_level =
+                        std::cmp::min(self.changed_this_decision_level, pa_last_index);
+                }
                 v.insert(PackageAssignments {
                     smallest_decision_level: self.current_decision_level,
                     highest_decision_level: self.current_decision_level,
@@ -217,12 +233,11 @@ impl<P: Package, V: Version, Priority: Ord + Clone> PartialSolution<P, V, Priori
     }
 
     pub fn prioritize(&mut self, prioritizer: impl Fn(&P, &Range<V>) -> Priority) -> Option<P> {
-        let check_all = self.just_backtracked;
-        self.just_backtracked = false;
+        let check_all = self.changed_this_decision_level == self.current_decision_level.0.saturating_sub(1) as usize;
         let current_decision_level = self.current_decision_level;
         let package_assignments = &self.package_assignments;
         let prioritized_potential_packages = &mut self.prioritized_potential_packages;
-        (self.current_decision_level.0 as usize..package_assignments.len())
+        (self.changed_this_decision_level..package_assignments.len())
             .map(|i| package_assignments.get_index(i).unwrap())
             .filter(|(_, pa)| check_all || pa.highest_decision_level == current_decision_level)
             .filter_map(|(p, pa)| pa.assignments_intersection.potential_package_filter(p))
@@ -230,6 +245,7 @@ impl<P: Package, V: Version, Priority: Ord + Clone> PartialSolution<P, V, Priori
                 let priority = prioritizer(&p, r);
                 prioritized_potential_packages.push(p.clone(), priority);
             });
+        self.changed_this_decision_level = package_assignments.len();
         prioritized_potential_packages.pop().map(|(p, _)| p)
     }
 
@@ -294,7 +310,7 @@ impl<P: Package, V: Version, Priority: Ord + Clone> PartialSolution<P, V, Priori
             }
         });
         self.prioritized_potential_packages.clear();
-        self.just_backtracked = true;
+        self.changed_this_decision_level = self.current_decision_level.0.saturating_sub(1) as usize;
     }
 
     /// We can add the version to the partial solution as a decision
