@@ -11,10 +11,14 @@ use crate::internal::small_map::SmallMap;
 use crate::package::Package;
 use crate::range::Range;
 use crate::term::Term;
-use crate::type_aliases::{Map, SelectedDependencies};
+use crate::type_aliases::SelectedDependencies;
 use crate::version::Version;
 
 use super::small_vec::SmallVec;
+
+use std::hash::BuildHasherDefault;
+
+type FnvIndexMap<K, V> = indexmap::IndexMap<K, V, BuildHasherDefault<rustc_hash::FxHasher>>;
 
 #[derive(Debug, Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub struct DecisionLevel(pub u32);
@@ -31,7 +35,7 @@ impl DecisionLevel {
 pub struct PartialSolution<P: Package, V: Version> {
     next_global_index: u32,
     current_decision_level: DecisionLevel,
-    package_assignments: Map<P, PackageAssignments<P, V>>,
+    package_assignments: FnvIndexMap<P, PackageAssignments<P, V>>,
 }
 
 impl<P: Package, V: Version> Display for PartialSolution<P, V> {
@@ -127,7 +131,7 @@ impl<P: Package, V: Version> PartialSolution<P, V> {
         Self {
             next_global_index: 0,
             current_decision_level: DecisionLevel(0),
-            package_assignments: Map::default(),
+            package_assignments: FnvIndexMap::default(),
         }
     }
 
@@ -147,10 +151,11 @@ impl<P: Package, V: Version> PartialSolution<P, V> {
                 },
             }
         }
+        let new_idx = self.current_decision_level.0 as usize;
         self.current_decision_level = self.current_decision_level.increment();
-        let mut pa = self
+        let (old_idx, _, mut pa) = self
             .package_assignments
-            .get_mut(&package)
+            .get_full_mut(&package)
             .expect("Derivations must already exist");
         pa.highest_decision_level = self.current_decision_level;
         pa.assignments_intersection = AssignmentsIntersection::Decision((
@@ -158,6 +163,9 @@ impl<P: Package, V: Version> PartialSolution<P, V> {
             version.clone(),
             Term::exact(version),
         ));
+        if new_idx != old_idx {
+            self.package_assignments.swap_indices(new_idx, old_idx);
+        }
         self.next_global_index += 1;
     }
 
@@ -168,7 +176,7 @@ impl<P: Package, V: Version> PartialSolution<P, V> {
         cause: IncompId<P, V>,
         store: &Arena<Incompatibility<P, V>>,
     ) {
-        use std::collections::hash_map::Entry;
+        use indexmap::map::Entry;
         let term = store[cause].get(&package).unwrap().negate();
         let dated_derivation = DatedDerivation {
             global_index: self.next_global_index,
@@ -209,9 +217,8 @@ impl<P: Package, V: Version> PartialSolution<P, V> {
     /// and if it contains at least one positive derivation term
     /// in the partial solution.
     pub fn potential_packages(&self) -> Option<impl Iterator<Item = (&P, &Range<V>)>> {
-        let mut iter = self
-            .package_assignments
-            .iter()
+        let mut iter = (self.current_decision_level.0 as usize..self.package_assignments.len())
+            .map(move |i| self.package_assignments.get_index(i).unwrap())
             .filter_map(|(p, pa)| pa.assignments_intersection.potential_package_filter(p))
             .peekable();
         if iter.peek().is_some() {
@@ -224,21 +231,17 @@ impl<P: Package, V: Version> PartialSolution<P, V> {
     /// If a partial solution has, for every positive derivation,
     /// a corresponding decision that satisfies that assignment,
     /// it's a total solution and version solving has succeeded.
-    pub fn extract_solution(&self) -> Option<SelectedDependencies<P, V>> {
-        let mut solution = Map::default();
-        for (p, pa) in &self.package_assignments {
-            match &pa.assignments_intersection {
-                AssignmentsIntersection::Decision((_, v, _)) => {
-                    solution.insert(p.clone(), v.clone());
+    pub fn extract_solution(&self) -> SelectedDependencies<P, V> {
+        self.package_assignments
+            .iter()
+            .take(self.current_decision_level.0 as usize)
+            .map(|(p, pa)| match &pa.assignments_intersection {
+                AssignmentsIntersection::Decision((_, v, _)) => (p.clone(), v.clone()),
+                AssignmentsIntersection::Derivations(_) => {
+                    panic!("Derivations in the Decision part")
                 }
-                AssignmentsIntersection::Derivations(term) => {
-                    if term.is_positive() {
-                        return None;
-                    }
-                }
-            }
-        }
-        Some(solution)
+            })
+            .collect()
     }
 
     /// Backtrack the partial solution to a given decision level.
@@ -381,7 +384,7 @@ impl<P: Package, V: Version> PartialSolution<P, V> {
     /// to return a coherent previous_satisfier_level.
     fn find_satisfier(
         incompat: &Incompatibility<P, V>,
-        package_assignments: &Map<P, PackageAssignments<P, V>>,
+        package_assignments: &FnvIndexMap<P, PackageAssignments<P, V>>,
         store: &Arena<Incompatibility<P, V>>,
     ) -> SmallMap<P, (usize, u32, DecisionLevel)> {
         let mut satisfied = SmallMap::Empty;
@@ -402,7 +405,7 @@ impl<P: Package, V: Version> PartialSolution<P, V> {
         incompat: &Incompatibility<P, V>,
         satisfier_package: &P,
         mut satisfied_map: SmallMap<P, (usize, u32, DecisionLevel)>,
-        package_assignments: &Map<P, PackageAssignments<P, V>>,
+        package_assignments: &FnvIndexMap<P, PackageAssignments<P, V>>,
         store: &Arena<Incompatibility<P, V>>,
     ) -> DecisionLevel {
         // First, let's retrieve the previous derivations and the initial accum_term.
