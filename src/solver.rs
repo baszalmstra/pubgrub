@@ -166,16 +166,17 @@ pub fn resolve<P: Package, VS: VersionSet>(
                             version: v.clone(),
                         });
                     }
-                    if let Some((dependent, _)) = x
-                        .iter()
-                        .find(|(_, r)| matches!(r, Requirement::Required(r) if r == &VS::empty()))
-                    {
-                        return Err(PubGrubError::DependencyOnTheEmptySet {
-                            package: p.clone(),
-                            version: v.clone(),
-                            dependent: dependent.clone(),
-                        });
-                    }
+                    // TODO: Disable this for now since some Conda package have this issue
+                    // if let Some((dependent, _)) = x
+                    //     .iter()
+                    //     .find(|(_, r)| matches!(r, Requirement::Required(r) if r == &VS::empty()))
+                    // {
+                    //     return Err(PubGrubError::DependencyOnTheEmptySet {
+                    //         package: p.clone(),
+                    //         version: v.clone(),
+                    //         dependent: dependent.clone(),
+                    //     });
+                    // }
                     x
                 }
             };
